@@ -12,16 +12,17 @@ Dependencies:
 - python-dotenv
 - tqdm
 - scikit-learn
+- requests
 
 Setup:
-1. Install dependencies: pip install beautifulsoup4 openai python-dotenv tqdm scikit-learn
+1. Install dependencies: pip install beautifulsoup4 openai python-dotenv tqdm scikit-learn requests
 2. Create a .env file with your OpenAI API key: OPENAI_API_KEY=your_key_here
 
 Usage:
 python organize.py input_bookmarks.html output_organized.html
 """
 
-import os, re, html, argparse, datetime, sys, collections
+import os, re, html, argparse, datetime, sys, collections, requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -166,46 +167,67 @@ def parse_netscape(html_path: str):
         traceback.print_exc()
         return []
     
-def extract_bookmarks(element, folder_path=None):
-    """Extract bookmarks from HTML with folder structure."""
+def extract_bookmarks(element, folder_path=None, is_toolbar=False):
+    """Extract bookmarks from HTML with folder structure, noting toolbar."""
     if element is None:
         return
         
     if folder_path is None:
         folder_path = []
     
-    # If element is an H3 tag, it's a folder
+    # Check if the current H3 indicates the toolbar folder
+    current_is_toolbar = is_toolbar
     if element.name == 'h3':
         folder_name = element.get_text(strip=True)
-        new_folder_path = folder_path + [folder_name]
+        # Check for common toolbar names or the specific attribute
+        if element.get('personal_toolbar_folder', 'false').lower() == 'true' or \
+           folder_name.lower() in ['favorites bar', 'bookmarks bar', 'toolbar']:
+           current_is_toolbar = True
+           folder_path = ['Toolbar'] # Standardize toolbar path
+        else:
+           current_is_toolbar = False # Reset if nested folder isn't toolbar
+           folder_path = folder_path + [folder_name]
         
         # Find the next DL after this H3, which contains items in this folder
         dl = element.find_next('dl')
         if dl:
-            yield from extract_bookmarks(dl, new_folder_path)
+            yield from extract_bookmarks(dl, folder_path, current_is_toolbar)
     
     # If element is a DL tag, it contains items
     elif element and element.name == 'dl':
+         # Check if THIS DL directly follows a toolbar H3
+        prev_dt = element.find_previous('dt')
+        if prev_dt:
+             h3_in_prev_dt = prev_dt.find('h3')
+             if h3_in_prev_dt and h3_in_prev_dt.get('personal_toolbar_folder', 'false').lower() == 'true':
+                 current_is_toolbar = True
+                 folder_path = ['Toolbar'] # Set path for items directly in toolbar DL
+
         for dt in element.find_all('dt', recursive=False):
             # If contains A tag, it's a bookmark
             a = dt.find('a')
             if a:
-                yield (
+                 # Use the potentially updated folder path
+                 current_folder_name = "/".join(folder_path) if folder_path else None
+                 # If it's identified as toolbar, ensure path reflects that
+                 if current_is_toolbar:
+                      current_folder_name = "Toolbar"
+                 yield (
                     a.get_text(strip=True),
                     a.get("href"),
                     a.get("add_date") or str(int(datetime.datetime.now().timestamp())),
-                    "/".join(folder_path) if folder_path else None
+                    current_folder_name
                 )
             
-            # If contains H3 tag, it's a subfolder
+            # If contains H3 tag, it's a subfolder - pass toolbar status down
             h3 = dt.find('h3')
             if h3:
-                yield from extract_bookmarks(h3, folder_path)
+                yield from extract_bookmarks(h3, folder_path, current_is_toolbar)
             
-            # If contains DL tag directly, process its content
+            # If contains DL tag directly, process its content - pass toolbar status down
             dl = dt.find('dl', recursive=False)
             if dl:
-                yield from extract_bookmarks(dl, folder_path)
+                yield from extract_bookmarks(dl, folder_path, current_is_toolbar)
 
 def analyze_bookmark_collection(bookmarks, max_sample=300):
     """Analyze the entire bookmark collection to determine optimal structure, focusing on user tasks."""
@@ -374,16 +396,62 @@ Based on the user analysis, tasks, and bookmark samples, design a streamlined, t
 
     return analysis_summary, structure, folder_counter
 
-def embed_and_cluster_bookmarks(bookmarks, max_clusters=20):
-    """Create embeddings and cluster bookmarks by semantic similarity."""
-    print(f"Generating embeddings for {len(bookmarks)} bookmarks...")
-    titles_and_urls = [f"{title}: {url}" for title, url, _, _ in bookmarks]
-    
+def embed_and_cluster_bookmarks(bookmarks, args, max_clusters=20):
+    """Create embeddings and cluster bookmarks by semantic similarity, optionally fetching content."""
+    print(f"Preparing data for {len(bookmarks)} bookmarks...")
+
+    content_for_embedding = []
+    # Use a session for potential connection pooling
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'BookmarkOrganizer/1.0 (+https://github.com/user/repo)'}) # Identify the bot
+
+    fetch_pbar = tqdm(bookmarks, desc="Fetching content", unit="bookmark", disable=not args.fetch_content)
+    for title, url, _, _ in fetch_pbar:
+        text_to_embed = f"{title}: {url}" # Default text
+
+        if args.fetch_content:
+            fetch_pbar.set_description(f"Fetching {url[:50]}...")
+            try:
+                response = session.get(url, timeout=5, allow_redirects=True) # Added timeout and redirects
+                response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+
+                # Check content type - only parse HTML
+                content_type = response.headers.get('Content-Type', '').lower()
+                if 'text/html' in content_type:
+                    soup = BeautifulSoup(response.content, 'html.parser')
+
+                    fetched_title = soup.find('title')
+                    fetched_title_text = fetched_title.get_text(strip=True) if fetched_title else title # Fallback to original title
+
+                    meta_desc = soup.find('meta', attrs={'name': 'description'})
+                    meta_desc_text = meta_desc['content'].strip() if meta_desc and meta_desc.get('content') else ""
+
+                    # Combine title, description, and URL for richer context
+                    text_to_embed = f"Title: {fetched_title_text}\nDescription: {meta_desc_text}\nURL: {url}"
+                    if args.debug: print(f"\nFetched data for {url}:\n{text_to_embed}\n---")
+
+                else:
+                    if args.debug: print(f"\nSkipping non-HTML content ({content_type}) for {url}")
+                    # Keep default text_to_embed (title: url) for non-HTML
+
+            except requests.exceptions.Timeout:
+                 if args.debug: print(f"\nTimeout fetching {url}")
+            except requests.exceptions.RequestException as e:
+                 if args.debug: print(f"\nError fetching {url}: {e}")
+            except Exception as e: # Catch other potential parsing errors
+                if args.debug: print(f"\nError processing {url}: {e}")
+                
+        content_for_embedding.append(text_to_embed)
+
+    print(f"Generating embeddings for {len(content_for_embedding)} items...")
     # Generate embeddings in batches if necessary (OpenAI API might have limits)
     batch_size = 1000  # Adjust as needed
     all_embeddings = []
-    for i in tqdm(range(0, len(titles_and_urls), batch_size), desc="Generating embeddings"):
-        batch = titles_and_urls[i:i+batch_size]
+    # Use content_for_embedding instead of titles_and_urls
+    embed_pbar = tqdm(range(0, len(content_for_embedding), batch_size), desc="Generating embeddings")
+    for i in embed_pbar:
+        batch = content_for_embedding[i:i+batch_size]
+        embed_pbar.set_description(f"Embedding batch {i//batch_size + 1}")
         try:
             response = client.embeddings.create(
                 model="text-embedding-3-small", # Using a cost-effective embedding model
@@ -397,6 +465,7 @@ def embed_and_cluster_bookmarks(bookmarks, max_clusters=20):
 
     # Filter out failed embeddings and corresponding bookmarks
     valid_embeddings = [emb for emb in all_embeddings if emb is not None]
+    # Ensure valid_bookmarks corresponds to the items that got embeddings
     valid_bookmarks = [bm for i, bm in enumerate(bookmarks) if all_embeddings[i] is not None]
 
     if not valid_embeddings:
@@ -409,12 +478,12 @@ def embed_and_cluster_bookmarks(bookmarks, max_clusters=20):
     # Determine the optimal number of clusters (e.g., min 5 bookmarks per cluster, up to max_clusters)
     n_clusters = min(max_clusters, num_bookmarks_with_embeddings // 5)
     if n_clusters < 1: n_clusters = 1 # Ensure at least one cluster
-        
+
     print(f"Clustering {num_bookmarks_with_embeddings} bookmarks into {n_clusters} clusters...")
-    
+
     # Cluster using K-means
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10) # Added n_init
-    
+
     try:
       clusters = kmeans.fit_predict(valid_embeddings)
     except Exception as e:
@@ -422,7 +491,6 @@ def embed_and_cluster_bookmarks(bookmarks, max_clusters=20):
         # Fallback: Assign all to a single cluster
         clusters = [0] * num_bookmarks_with_embeddings
         n_clusters = 1
-
 
     # Group bookmarks by cluster_id
     clustered_bookmarks = collections.defaultdict(list)
@@ -432,9 +500,9 @@ def embed_and_cluster_bookmarks(bookmarks, max_clusters=20):
         clustered_bookmarks[cluster_id].append(bookmark)
         # Map original bookmark tuple (title, url) to cluster_id
         bookmark_to_cluster[(bookmark[0], bookmark[1])] = cluster_id
-        
+
     print(f"Clustering complete. Found {len(clustered_bookmarks)} clusters.")
-    
+
     # Add bookmarks with failed embeddings to a separate "unclustered" group if needed
     unclustered_bookmarks = [bm for i, bm in enumerate(bookmarks) if all_embeddings[i] is None]
     if unclustered_bookmarks:
@@ -445,106 +513,83 @@ def embed_and_cluster_bookmarks(bookmarks, max_clusters=20):
 
     return clustered_bookmarks, bookmark_to_cluster
 
-def batch_classify(bookmarks, batch_size=10, collection_structure="", original_folders=None):
-    """Classify bookmarks by clustering and assigning folders to clusters."""
+def classify_bookmarks(bookmarks, collection_structure):
+    """Classify each bookmark individually against the proposed structure."""
+    print(f"Performing initial classification for {len(bookmarks)} bookmarks...")
     results = {}
-    
-    # 1. Embed and cluster bookmarks
-    clustered_bookmarks, bookmark_to_cluster = embed_and_cluster_bookmarks(bookmarks)
-    cluster_labels = {}
-    
-    # 2. Label each cluster using LLM
-    print(f"Labeling {len(clustered_bookmarks)} clusters...")
-    pbar_clusters = tqdm(clustered_bookmarks.items(), desc="Labeling clusters", unit="cluster")
-    
-    for cluster_id, cluster_items in pbar_clusters:
-        pbar_clusters.set_description(f"Labeling cluster {cluster_id}")
-        
-        if cluster_id == -1: # Handle bookmarks with failed embeddings
-            cluster_labels[cluster_id] = "Uncategorized" # Assign directly
-            print(f"Cluster {cluster_id} (failed embeddings) assigned to Uncategorized.")
-            continue
-            
-        if not cluster_items:
-            print(f"Cluster {cluster_id} is empty, skipping.")
-            continue
+    batch_size = 20 # Experiment with batch size for API calls
+    batches = [bookmarks[i:i+batch_size] for i in range(0, len(bookmarks), batch_size)]
 
-        # Take a sample of bookmarks from the cluster for labeling
-        sample_size = min(len(cluster_items), 10) # Use up to 10 samples
-        sample_content = []
-        for j, (title, url, _, orig_folder) in enumerate(cluster_items[:sample_size]):
-            folder_context = f" [Original folder: {orig_folder}]" if orig_folder else ""
-            sample_content.append(f"Sample {j+1}:\nTitle: {title}\nURL: {url}{folder_context}")
+    system_prompt = f"""You are an assistant classifying bookmarks into a predefined folder structure.
+Assign EACH bookmark to the *most appropriate* path from the structure provided below.
+The structure uses '/' for hierarchy (e.g., Tech/AI).
 
-        system_prompt = """You are an assistant that assigns a single folder path to a cluster of similar bookmarks.
-Analyze the sample bookmarks provided from a cluster and determine the single best folder path from the provided structure.
+RULES:
+1.  **Strict Adherence:** ONLY use folder paths that exist in or can be directly derived from the provided structure.
+2.  **Best Fit:** Choose the most specific relevant path. If a bookmark fits 'Tech/AI', use that instead of just 'Tech'.
+3.  **Top-Level OK:** If no sub-category fits well, assign to the top-level category (e.g., 'Tech').
+4.  **Uncategorized:** If a bookmark clearly does not fit *any* category in the structure, assign it the path 'Uncategorized'. Do not invent new categories.
+5.  **Format:** Respond ONLY with a numbered list matching the input bookmarks, followed by the assigned path. Example:
+    1. Tech/Development
+    2. Communicate/Email
+    3. Uncategorized
 
-FOCUS ON CONSOLIDATION:
-1. Choose the broadest, most appropriate category from the STRUCTURE guide.
-2. Avoid creating new subfolders unless absolutely necessary and justified by the samples.
-3. Prioritize using the existing top-level categories.
-4. If no category fits well, assign to 'Uncategorized'.
-
-Return ONLY the single, concise folder path (e.g., Technology/AI, Finance, Education)."""
-        
-        if collection_structure:
-            system_prompt += f"""
-
-IMPORTANT: Use this folder structure as your guide:
+PROVIDED STRUCTURE:
 {collection_structure}
-
-Assign the cluster to ONE of these paths. DO NOT create new top-level categories.
 """
-        else:
-            system_prompt += "\n\nCreate a simple, high-level folder path (e.g., Technology, News, Shopping)."
-            
-        # Prepare the joined sample content outside the f-string
-        joined_sample_content = "\n\n".join(sample_content)
-            
-        user_prompt = f"""Cluster contains {len(cluster_items)} bookmarks.
-Here are {sample_size} samples from the cluster:
 
-{joined_sample_content}
+    for batch in tqdm(batches, desc="Classifying bookmarks", unit="batch"):
+        batch_content = []
+        for j, (title, url, _, orig_folder) in enumerate(batch):
+            folder_context = f" [Original folder: {orig_folder}]" if orig_folder else ""
+            batch_content.append(f"Bookmark {j+1}:\\nTitle: {title}\\nURL: {url}{folder_context}")
 
-Please assign the most appropriate folder path for this entire cluster based on the provided structure guide.
-Return ONLY the folder path.
-"""
+        # Pre-join the content to avoid backslash in f-string expression
+        joined_batch_content = "\\n\\n".join(batch_content)
+
+        user_prompt = f"""Please classify the following {len(batch)} bookmarks based *only* on the structure provided in the system prompt.
+
+{joined_batch_content}
+
+Respond ONLY with the numbered list and assigned paths."""
 
         try:
             resp = client.chat.completions.create(
-                model=args.model,  # Use user-specified model (potentially more powerful)
+                model=args.model, # Use the main model for initial classification
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.1, # Low temperature for deterministic labeling
+                temperature=0.1,
             )
-            path = resp.choices[0].message.content.strip().lstrip("/")
-            if not path:
-                path = "Uncategorized" # Fallback if LLM returns empty string
-            # Clean up potential LLM conversational additions
-            if ":" in path:
-                 path = path.split(":", 1)[-1].strip()
-            if path.startswith("-"): path = path.lstrip("-").strip()
-            if path.startswith("•"): path = path.lstrip("•").strip()
-            if "folder path is:" in path.lower(): path = path.split(":")[-1].strip()
-            # Ensure path doesn't exceed max depth (simple check for now)
-            if path.count('/') > 2:
-                path = "/".join(path.split('/')[:3])
-                
-            cluster_labels[cluster_id] = path if path else "Uncategorized"
-            pbar_clusters.set_postfix(category=path if path else "Uncategorized")
+            classifications_text = resp.choices[0].message.content.strip()
             
-        except Exception as e:
-            print(f"Error labeling cluster {cluster_id}: {e}")
-            cluster_labels[cluster_id] = "Uncategorized" # Fallback on error
+            # Parse response
+            lines = classifications_text.split('\\n')
+            for j, (title, url, _, _) in enumerate(batch):
+                found = False
+                for line in lines:
+                    line = line.strip()
+                    if line.startswith(f"{j+1}."):
+                        parts = line.split(".", 1)
+                        if len(parts) > 1:
+                            path = parts[1].strip().lstrip("/")
+                            if path:
+                                results[(title, url)] = path
+                                found = True
+                                break
+                if not found:
+                    results[(title, url)] = "Uncategorized" # Fallback if parsing fails for an item
 
-    # 3. Assign the determined cluster label to all bookmarks in that cluster and apply heuristics
-    print("Assigning cluster labels and applying heuristics...")
-    for (title, url), cluster_id in bookmark_to_cluster.items():
-        assigned_path = cluster_labels.get(cluster_id, "Uncategorized")
-        
-        # Heuristic Overrides:
+        except Exception as e:
+            print(f"Error classifying batch: {e}. Assigning batch to Uncategorized.")
+            for title, url, _, _ in batch:
+                results[(title, url)] = "Uncategorized"
+
+    # --- Apply Heuristics ---
+    print("Applying classification heuristics...")
+    refined_results = {}
+    for (title, url), assigned_path in results.items():
         url_lower = url.lower()
         title_lower = title.lower()
         
@@ -553,26 +598,24 @@ Return ONLY the folder path.
             assigned_path = "Communicate/Email"
         # Social Media / Professional Networks
         elif "linkedin.com" in url_lower:
-            assigned_path = "Career/LinkedIn" # Be more specific for LinkedIn
+            assigned_path = "Career/LinkedIn" 
         elif "reddit.com" in url_lower:
-             # Could be learn, tech, entertainment - check title/original path?
-             if "/r/OSUOnlineCS" in url_lower or "/r/flask" in url_lower: # Example specific subreddits
+             if "/r/OSUOnlineCS" in url_lower or "/r/flask" in url_lower: 
                  assigned_path = "Learn/Tech Communities"
              elif "/r/datascience" in url_lower:
                   assigned_path = "Learn/Data Science"
+             elif "/r/realdebrid" in url_lower or "/r/plexdebrid" in url_lower:
+                 assigned_path = "Media/Streaming Tech" # More specific
              else:
-                  assigned_path = "Media/Social Media/Reddit" # Default Reddit
-        elif "twitch.tv" in url_lower or "youtube.com" in url_lower or "spotify.com" in url_lower or "hulu.com" in url_lower or "hbomax.com" in url_lower:
-            # Check for educational YouTube links
-            edu_keywords = ['tutorial', 'learn', 'lecture', 'course', 'cs', 'programming', 'python', 'javascript']
+                  assigned_path = "Media/Social/Reddit" 
+        elif "twitch.tv" in url_lower or "youtube.com" in url_lower or "spotify.com" in url_lower or "hulu.com" in url_lower or "hbomax.com" in url_lower or "netflix.com" in url_lower:
+            edu_keywords = ['tutorial', 'learn', 'lecture', 'course', 'cs', 'programming', 'python', 'javascript', 'data science', 'coding', 'mit']
             if "youtube.com" in url_lower and any(keyword in title_lower for keyword in edu_keywords):
                 assigned_path = "Learn/Videos & Tutorials"
             else:
                 assigned_path = "Media/Entertainment"
         # Development Platforms
         elif "github.com" in url_lower:
-             # Distinguish between learning repos and personal/professional?
-             # Maybe check original folder? For now, general Dev
              assigned_path = "Tech/Development/GitHub"
         # Educational Platforms
         elif "canvas." in url_lower or ".edu" in url_lower.split('/')[0]: # Check domain
@@ -586,13 +629,204 @@ Return ONLY the folder path.
         # Finance / Banking
         elif "schwab.com" in url_lower or "paypal.com" in url_lower or "fincen.gov" in url_lower or "monarchmoney.com" in url_lower:
              assigned_path = "Finance/Banking & Taxes"
+        # Home Lab / Networking
+        elif any(k in url_lower for k in ["192.168.", "synology.com", "unifi.ui.com", "pi-hole", "adguard", "heimdall", "portainer", "plex.tv", "tailscale"]):
+             assigned_path = "Tech/Home Lab"
              
-        # Add more heuristics as needed...
+        refined_results[(title, url)] = assigned_path
+
+    print("Initial classification and heuristics complete.")
+    return refined_results
+
+def refine_large_folders(bookmarks, classifications, collection_structure, threshold=25):
+    """Identify large folders and refine classification by adding sub-categories."""
+    print(f"\\nRefining folders with more than {threshold} items...")
+    
+    # 1. Count items per top-level folder
+    top_level_counts = collections.Counter()
+    bookmarks_by_top_level = collections.defaultdict(list)
+    original_classifications = classifications.copy() # Keep original for re-classification
+    
+    for (title, url), path in classifications.items():
+        top_level = path.split('/')[0]
+        top_level_counts[top_level] += 1
+        # Find the original bookmark tuple to pass to sub-categorization
+        # This assumes title+url is unique, which our deduplication helps with
+        # A more robust way would be to pass the full bookmark list and filter
+        bookmark = next((b for b in bookmarks if b[0] == title and b[1] == url), None)
+        if bookmark:
+           bookmarks_by_top_level[top_level].append(bookmark)
+           
+    large_folders = {folder for folder, count in top_level_counts.items() if count > threshold and folder != "Uncategorized" and folder != "Toolbar"}
+    
+    if not large_folders:
+        print("No large folders found needing refinement.")
+        return classifications # Return original classifications if no refinement needed
+
+    print(f"Found {len(large_folders)} large folders to refine: {', '.join(large_folders)}")
+
+    # 2. For each large folder, propose sub-categories
+    refined_classifications = classifications.copy() # Work on a copy
+
+    for folder_name in large_folders:
+        print(f"\\nProposing sub-categories for large folder: '{folder_name}' ({top_level_counts[folder_name]} items)")
+        folder_bookmarks = bookmarks_by_top_level[folder_name]
+        sample_size = min(len(folder_bookmarks), 15) # Sample up to 15 items
+        sample_content = []
+        # Ensure we get the correct bookmark tuple for sampling
+        for j, bm in enumerate(random.sample(folder_bookmarks, sample_size)):
+             title, url, _, orig_folder = bm
+             folder_context = f" [Original folder: {orig_folder}]" if orig_folder else ""
+             sample_content.append(f"Sample {j+1}:\\nTitle: {title}\\nURL: {url}{folder_context}")
+             
+        subcat_system_prompt = f"""You are an expert information architect. Given a main category '{folder_name}' and a sample of bookmarks classified within it, propose 2-5 meaningful sub-categories to improve organization.
+
+RULES:
+1.  **Relevance:** Sub-categories MUST be relevant to the main category '{folder_name}'.
+2.  **Based on Samples:** Sub-categories should reflect clear groupings observed in the provided bookmark samples.
+3.  **Concise Naming:** Use short, clear names (1-3 words).
+4.  **Format:** Return ONLY a numbered list of proposed sub-category names. Example:
+    1. SubCategoryA
+    2. SubCategoryB
+    3. SubCategoryC
+
+DO NOT include the main category in the sub-category names (e.g., return 'AI', not 'Tech/AI').
+If no clear sub-categories emerge, return ONLY the text 'None'."""
         
-        results[(title, url)] = assigned_path
+        # Pre-join sample content
+        joined_subcat_sample_content = "\\n\\n".join(sample_content)
         
-    print("Batch classification complete.")
-    return results
+        subcat_user_prompt = f"""Main category: '{folder_name}'
+Sample bookmarks ({sample_size} items):
+
+{joined_subcat_sample_content}
+
+Propose 2-5 relevant sub-categories for '{folder_name}' based ONLY on these samples. Follow the format rules strictly. If no clear sub-categories, output 'None'."""
+
+        proposed_subcats = []
+        try:
+            # Use faster model for sub-cat proposal if available, else args.model
+            subcat_model = "gpt-4o-mini" if "gpt-4o-mini" in [choice for choice in ap.get_default('model')] else args.model 
+            subcat_resp = client.chat.completions.create(
+                model=subcat_model, 
+                messages=[
+                    {"role": "system", "content": subcat_system_prompt},
+                    {"role": "user", "content": subcat_user_prompt}
+                ],
+                temperature=0.2,
+                max_tokens=100,
+            )
+            response_text = subcat_resp.choices[0].message.content.strip()
+            if response_text.lower() != 'none':
+                 # Extract sub-categories from numbered list
+                 lines = response_text.split('\\n')
+                 for line in lines:
+                     line = line.strip()
+                     if line and line[0].isdigit() and '.' in line:
+                         subcat = line.split('.', 1)[1].strip()
+                         # Basic validation: avoid overly long/complex names
+                         if subcat and len(subcat) < 30 and '/' not in subcat: 
+                             proposed_subcats.append(subcat)
+                 print(f"Proposed sub-categories for {folder_name}: {proposed_subcats}")
+            else:
+                 print(f"No clear sub-categories proposed for {folder_name}.")
+
+        except Exception as e:
+            print(f"Error proposing sub-categories for {folder_name}: {e}")
+            
+        if not proposed_subcats:
+            continue # Skip re-classification if no sub-categories were proposed
+
+        # 3. Re-classify bookmarks within this large folder
+        print(f"Re-classifying {len(folder_bookmarks)} bookmarks within '{folder_name}' using sub-categories...")
+        
+        # Prepare structure snippet for the prompt
+        subcat_list_str = "\\n".join([f"- {sc}" for sc in proposed_subcats])
+        reclassify_system_prompt = f"""You are classifying bookmarks WITHIN the main category '{folder_name}'.
+Assign EACH bookmark to the *most appropriate* sub-category from the list below, or keep it in the main '{folder_name}' category if none fit well.
+
+SUB-CATEGORIES for '{folder_name}':
+{subcat_list_str}
+- (Keep in '{folder_name}') <-- Choose this if no sub-category fits
+
+RULES:
+1.  **Choose One:** Select the single best fit from the sub-categories OR the main category option.
+2.  **Format:** Respond ONLY with a numbered list matching the input bookmarks, followed by the chosen sub-category name OR '{folder_name}'. Example:
+    1. SubCategoryA
+    2. {folder_name}
+    3. SubCategoryB
+"""
+        
+        # Re-classify in batches
+        reclassify_batches = [folder_bookmarks[i:i+batch_size] for i in range(0, len(folder_bookmarks), batch_size)]
+        for batch in tqdm(reclassify_batches, desc=f"Re-classifying {folder_name}", unit="batch"):
+            batch_content = []
+            current_batch_tuples = [] # Keep track of (title, url) for updating results
+            for j, (title, url, _, orig_folder) in enumerate(batch):
+                 folder_context = f" [Original folder: {orig_folder}]" if orig_folder else ""
+                 batch_content.append(f"Bookmark {j+1}:\\nTitle: {title}\\nURL: {url}{folder_context}")
+                 current_batch_tuples.append((title, url))
+
+            # Pre-join reclassify content
+            joined_reclassify_batch_content = "\\n\\n".join(batch_content)
+
+            reclassify_user_prompt = f"""Please re-classify the following {len(batch)} bookmarks currently in '{folder_name}'. Assign each to the most appropriate sub-category listed in the system prompt, or indicate to keep it in '{folder_name}'.
+
+{joined_reclassify_batch_content}
+
+Respond ONLY with the numbered list and assigned sub-category (or main category name)."""
+            
+            try:
+                reclassify_resp = client.chat.completions.create(
+                    model=reclassify_model, # Faster model for re-classification
+                    messages=[
+                        {"role": "system", "content": reclassify_system_prompt},
+                        {"role": "user", "content": reclassify_user_prompt}
+                    ],
+                    temperature=0.1,
+                 )
+                reclass_text = reclassify_resp.choices[0].message.content.strip()
+                
+                # Parse response and update classifications
+                lines = reclass_text.split('\\n')
+                updates_made = 0
+                for j, (title, url) in enumerate(current_batch_tuples):
+                    found = False
+                    for line in lines:
+                        line = line.strip()
+                        if line.startswith(f"{j+1}."):
+                            parts = line.split(".", 1)
+                            if len(parts) > 1:
+                                choice = parts[1].strip()
+                                # Validate choice against proposed subcats or main folder name
+                                if choice in proposed_subcats: 
+                                    refined_path = f"{folder_name}/{choice}"
+                                    refined_classifications[(title, url)] = refined_path
+                                    found = True
+                                    updates_made += 1
+                                elif choice == folder_name: # Explicitly kept in main folder
+                                    refined_classifications[(title, url)] = folder_name
+                                    found = True
+                                    updates_made += 1
+                                # Else: Invalid response from LLM, keep original path
+                                break 
+                    # if not found, original path remains from refined_classifications copy
+                # print(f"Batch {batch_index} for {folder_name}: {updates_made}/{len(batch)} updated.")
+
+            except Exception as e:
+                print(f"Error re-classifying batch for {folder_name}: {e}")
+                # Keep original paths for this batch on error
+
+    print("Folder refinement complete.")
+    # Print counts again after refinement
+    final_category_counts = collections.Counter()
+    for path in refined_classifications.values():
+         final_category_counts[path.split('/')[0]] += 1
+    print("\\nCategory distribution *after* refinement:")
+    for category, count in final_category_counts.most_common():
+        print(f"- {category}: {count} bookmarks")
+
+    return refined_classifications
 
 def classify(title: str, url: str) -> str:
     # This function is no longer directly used by batch_classify, 
@@ -600,73 +834,85 @@ def classify(title: str, url: str) -> str:
     # Consider removing if truly unused.
     """Return a category path from the LLM."""
     resp = client.chat.completions.create(
-        model="o4-mini",
+        model="gpt-4o-mini", # Use mini for potentially faster single calls
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT}, # Use the simpler original system prompt here
-            {"role": "user",   "content": f"Title: {title}\nURL: {url}"}
+            {"role": "user",   "content": f"Title: {title}\\nURL: {url}"}
         ],
         # temperature=0.2,
     )
     path = resp.choices[0].message.content.strip().lstrip("/")
     return path if path else "Uncategorized"
 
-def build_tree(bookmarks):
+def build_tree(bookmarks, args):
     """Return nested dict {folder: subtree_or_list_of_links}."""
     tree = {}
     
-    # Analyze the entire collection first
+    # Analyze the entire collection first to get structure proposal
     bookmark_list = bookmarks
     analysis, structure, original_folders = analyze_bookmark_collection(bookmark_list)
     
     # Pre-classify all bookmarks using the new cluster-based method
     print("Classifying bookmarks based on clustering and analysis...")
-    classifications = batch_classify(bookmark_list, collection_structure=structure, original_folders=original_folders)
+    classifications = batch_classify(bookmark_list, args=args, collection_structure=structure, original_folders=original_folders)
     
     # Ensure we have at least one classification for each bookmark
     for title, url, add_date, _ in bookmark_list:
-        if (title, url) not in classifications or not classifications[(title, url)]:
-            # Assign default category if missing
-            print(f"Warning: Bookmark '{(title, url)}' was not classified. Assigning to Uncategorized.")
-            classifications[(title, url)] = "Uncategorized"
+        bm_tuple = (title, url)
+        if bm_tuple not in classifications or not classifications[bm_tuple] or classifications[bm_tuple].strip() == "":
+            print(f"Warning: Bookmark '{title}' ({url}) ended up unclassified. Assigning to Uncategorized.")
+            classifications[bm_tuple] = "Uncategorized"
     
-    # Count categories to confirm they're being used
-    category_counts = collections.Counter([path.split('/')[0] for path in classifications.values()])
-    print("\nCategory distribution after classification:")
-    for category, count in category_counts.most_common():
-        print(f"- {category}: {count} bookmarks")
-    
-    # Build tree with the classifications
+    # Build tree with the FINAL classifications
+    print("\\nStep 5: Building final folder structure...")
     pbar = tqdm(bookmark_list, desc="Building folder structure", unit="bookmark")
-    for title, url, add_date, _ in pbar:
+    for title, url, add_date, original_folder in pbar: # Pass original_folder
         pbar.set_description(f"Processing: {title[:40]}{'...' if len(title) > 40 else ''}")
         try:
-            # Get path, ensure it exists
-            path_str = classifications.get((title, url))
-            if not path_str or path_str.strip() == "":
-                path_str = "Uncategorized"
-                
+            # Check if it was identified as a Toolbar item during parsing FIRST
+            if original_folder == "Toolbar":
+                path_str = "Toolbar"
+            else:
+                 # Get the FINAL classification
+                path_str = classifications.get((title, url), "Uncategorized") # Default to Uncategorized
+                if not path_str or path_str.strip() == "":
+                    path_str = "Uncategorized"
+            
             # Split path into folder hierarchy
-            path = path_str.split("/")
-            pbar.set_postfix(category=f"{'/' + '/'.join(path) if path else 'Uncategorized'}") # Added prefix slash for clarity
+            path = [p for p in path_str.split("/") if p] # Remove empty parts
+            
+            # --- Depth Limiting ---
+            max_depth = 2 # Allow Category/Subcategory
+            if len(path) > max_depth:
+                print(f"Warning: Path '{path_str}' for '{title}' exceeds max depth {max_depth}. Truncating.")
+                path = path[:max_depth]
+            # Ensure path is not empty after potential truncation/cleaning
+            if not path: 
+                path = ["Uncategorized"] 
+
+            pbar.set_postfix(category=f"/{'/'.join(path)}") # Added prefix slash for clarity
             
             # Create folder hierarchy
             node = tree
             for part in path:
-                if not part:  # Skip empty path components
-                    continue
-                # Ensure keys are strings
+                # Ensure keys are strings and not empty
                 part = str(part).strip()
-                if not part: continue # Skip if part becomes empty after stripping
+                if not part: continue
+                # Prevent creating dict inside _links list
+                if not isinstance(node, dict):
+                    # This should ideally not happen with correct path handling
+                    # If it does, log error and place in Uncategorized
+                    print(f"Error: Trying to create subfolder '{part}' within non-dict node for path {'/'.join(path)}. Item: '{title}'")
+                    node = tree.setdefault("Uncategorized", {}) 
+                    break # Stop processing this path segment
                 node = node.setdefault(part, {})
-            
+
             # Add link to the leaf folder
             if isinstance(node, dict):
               node.setdefault("_links", []).append((title, url, add_date))
             else:
-              # This case might happen if a path part conflicts with _links, handle gracefully
-              print(f"Warning: Could not add link '{title}' to node {path}. Node is not a dictionary.")
-              parent_node = tree # Find parent node to add to uncategorized or similar
-              # For simplicity, add to root Uncategorized for now
+              # This case should be rare now, but handle just in case
+              print(f"Warning: Could not add link '{title}' to node {'/'.join(path)}. Node is not a dictionary.")
               uncategorized_node = tree.setdefault("Uncategorized", {})
               uncategorized_node.setdefault("_links", []).append((title, url, add_date))
 
@@ -675,128 +921,128 @@ def build_tree(bookmarks):
             import traceback
             pbar.write(traceback.format_exc())
             # Ensure the bookmark is still added somewhere
-            node = tree.setdefault("Uncategorized", {})
-            node.setdefault("_links", []).append((title, url, add_date))
-    
-    # Create default folders for empty categories to ensure structure matches analysis
-    if not tree and len(bookmark_list) > 0:
-        print("Warning: No folders were created. Creating default structure...")
-        # Extract top-level categories from the analysis structure
-        if structure:
-            # Try to parse main categories from the structure description
-            categories = []
-            lines = structure.split('\n')
-            for line in lines:
-                if line.strip().startswith('-') or line.strip().startswith('•'):
-                    # Extract category name
-                    category = line.strip().lstrip('-').lstrip('•').strip()
-                    if '/' in category:
-                        category = category.split('/')[0].strip()
-                    if '(' in category:
-                        category = category.split('(')[0].strip()
-                    if category:
-                        categories.append(category)
-            
-            # Create empty folders for each category
-            for category in categories:
-                if category not in tree:
-                    tree[category] = {"_links": []}
-    
-    # Consolidate the tree to eliminate folders with only a single bookmark or subfolder
+            uncategorized_node = tree.setdefault("Uncategorized", {})
+            uncategorized_node.setdefault("_links", []).append((title, url, add_date))
+
+    # --- Post-Build Cleanup ---
+    # Remove completely empty folders recursively
+    tree = remove_empty_folders(tree)
+
+    # Separate Toolbar for specific handling
+    toolbar_node = tree.pop("Toolbar", None)
+
+    # Consolidate the main tree (excluding Toolbar)
     if not args.skip_consolidation and tree:
-        tree = consolidate_tree(tree)
-    
+        print("\\nStep 6: Consolidating Tree Structure...")
+        tree = consolidate_tree(tree) # Use relaxed consolidation
+
+    # Re-add Toolbar at the root if it existed
+    if toolbar_node:
+        tree["Toolbar"] = toolbar_node
+        # We'll handle sorting during export
+
+    # Return the final tree and the initial analysis text
+    global classifications_for_export # Use global to pass to main scope for saving
+    classifications_for_export = classifications 
     return tree, analysis
 
-def consolidate_tree(node, parent_path=""):
-    """Eliminate excessive nesting and folders with just 1-2 items."""
+def remove_empty_folders(node):
+    """Recursively remove folders that have no links and no subfolders."""
     if not isinstance(node, dict):
         return node
     
+    # Recursively clean children
+    for name, child in list(node.items()):
+        if name != "_links":
+            cleaned_child = remove_empty_folders(child)
+            if isinstance(cleaned_child, dict) and not cleaned_child.get("_links") and all(k == "_links" for k in cleaned_child):
+                 # If child only contains an empty _links list after cleaning, remove it
+                 if not cleaned_child["_links"]:
+                     print(f"Removing empty folder structure resulting from: {name}")
+                     del node[name]
+                 else: # Keep it if it has links
+                     node[name] = cleaned_child
+            elif not cleaned_child and name != "_links": # Remove if child itself becomes empty
+                 print(f"Removing empty folder: {name}")
+                 del node[name]
+            else:
+                 node[name] = cleaned_child # Update with potentially cleaned child
+
+    # Check current node after cleaning children
+    # Remove node if it's a dict, has no _links (or empty _links), and no other keys left
+    if isinstance(node, dict):
+         has_links = "_links" in node and node["_links"]
+         has_other_folders = any(k != "_links" for k in node)
+         if not has_links and not has_other_folders:
+             return {} # Return empty dict to signal removal by caller
+             
+    return node
+
+def consolidate_tree(node, parent_path=""):
+    """Eliminate excessive nesting and merge very small folders."""
+    if not isinstance(node, dict):
+        return node
+        
+    consolidated_node = {}
+
     # Process children first (bottom-up approach)
     for name, child in list(node.items()):
-        if name != "_links" and isinstance(child, dict):
-            node[name] = consolidate_tree(child, f"{parent_path}/{name}" if parent_path else name)
-    
-    # Check if this node has only one subfolder and no direct links
-    if len(node) == 1 and "_links" not in node:
-        # Get the only child's name and content
-        child_name, child_content = next(iter(node.items()))
-        
-        # If child has direct links but no other folders, merge with parent
-        if "_links" in child_content and len(child_content) == 1:
-            return {"_links": child_content["_links"]}
-        
-        # If child has only a few links and no other folders, merge with parent
-        if "_links" in child_content and len(child_content) == 2 and len(child_content["_links"]) <= 2:
-            links = child_content["_links"]
-            other_child_name, other_child_content = next((k, v) for k, v in child_content.items() if k != "_links")
-            # Only merge if the *other* child is also very small (<=1 link)
-            if len(other_child_content.get("_links", [])) <= 1 and len(other_child_content) == 1:
-                # Merge both child's links and grandchild's links into parent
-                all_links = links + other_child_content["_links"]
-                return {"_links": all_links}
-    
-    # Check for small folders that could be consolidated
-    small_folders = {}
-    for name, child in list(node.items()):
-        if name != "_links" and isinstance(child, dict):
-            # Check if it's a small folder (1 link and no subfolders, or 0 links and 1 small subfolder)
-            num_links = len(child.get("_links", []))
-            subfolder_count = sum(1 for k, v in child.items() if k != "_links" and isinstance(v, dict))
-            only_small_subfolders = all(k == "_links" or (isinstance(v, dict) and len(v.get("_links", [])) <= 1 and len(v) == 1) 
-                                     for k, v in child.items() if k != "_links")
-                                     
-            # Condition: Folder has 1 link and no subfolders, OR 0 links and only 1 small subfolder
-            if (num_links == 1 and subfolder_count == 0) or \
-               (num_links == 0 and subfolder_count == 1 and only_small_subfolders):
-                # Let's not automatically mark for consolidation here, handle single-item folders below
-                pass 
-            # Condition: Folder has <= 2 links AND only contains small subfolders (or no subfolders)
-            elif num_links <= 2 and only_small_subfolders and subfolder_count <= 1: # Relaxed condition
-                 small_folders[name] = child
+        if name == "_links":
+            if child: # Only add _links if it's not empty
+               consolidated_node["_links"] = child
+            continue # Skip _links from folder processing
+            
+        if isinstance(child, dict):
+            processed_child = consolidate_tree(child, f"{parent_path}/{name}" if parent_path else name)
+            # Only add child back if it's not empty after consolidation
+            if processed_child: 
+                consolidated_node[name] = processed_child
+        else: # Should not happen if structure is correct, but handle defensively
+             consolidated_node[name] = child 
 
-    # If we have multiple *very* small folders (e.g., <=2 items total each), consider merging them
-    # This logic might need careful tuning based on desired outcome
-    folders_to_merge = {}
-    for name, folder in small_folders.items():
-        total_items = len(folder.get("_links", [])) + \
-                      sum(len(subfolder.get("_links", [])) for subname, subfolder in folder.items() if subname != "_links")
-        if total_items <= 2: # Only consider merging if the total content is tiny
-            folders_to_merge[name] = folder
+    # --- Consolidation Logic (Applied to consolidated_node) ---
 
-    if len(folders_to_merge) > 1 and len(folders_to_merge) <= 3: # Keep condition to merge 2 or 3
-        # Create a new merged folder (use the parent path + a generic name? or first name?)
-        # Using first name for simplicity, but could be improved
-        merged_name = next(iter(folders_to_merge.keys())) 
+    # 1. Merge folder if it ONLY contains another folder (remove nesting)
+    #    e.g., A/B/_links -> A/_links (if B has nothing else)
+    #    e.g., A/B/C/_links -> A/C/_links (if B has nothing else) 
+    #    (This requires careful checking - let's simplify for now)
+    #    Simpler: If a folder X has ONLY one entry Y (which is a folder), and X has no links,
+    #    replace X with Y's contents under X's original parent, maybe renaming Y? (Complex)
+    #    Let's skip this aggressive nesting removal for now, focus on small folders.
+
+    # 2. Merge *very* small folders (e.g., exactly 1 link, no subfolders) into parent?
+    #    Let's make this OPTIONAL or less aggressive. Only merge if parent *also* has links?
+    #    New Rule: Keep folders even if they only have 1 link. Let's NOT merge single-item folders upwards automatically.
+    #    The previous logic was a bit too complex and might merge things undesirably.
+    #    We will rely on `remove_empty_folders` to clean up genuinely empty ones.
+    
+    # 3. Merge multiple tiny sibling folders (<= 2 links total, no subfolders each)
+    small_sibling_folders = {}
+    for name, child in list(consolidated_node.items()):
+         if name != "_links" and isinstance(child, dict):
+             num_links = len(child.get("_links", []))
+             subfolder_count = sum(1 for k in child if k != "_links")
+             if num_links <= 2 and subfolder_count == 0:
+                  small_sibling_folders[name] = child
+                  
+    if len(small_sibling_folders) > 1 and len(small_sibling_folders) <= 3:
+        merged_name = next(iter(small_sibling_folders.keys())) # Use first name
         merged_folder = {"_links": []}
-        print(f"Consolidating {list(folders_to_merge.keys())} into {merged_name} at path {parent_path}")
-        
-        # Collect all links
-        for name, folder in folders_to_merge.items():
+        print(f"Consolidating tiny sibling folders {list(small_sibling_folders.keys())} into '{merged_name}' at path '{parent_path}'")
+
+        for name, folder in small_sibling_folders.items():
             if "_links" in folder:
                 merged_folder["_links"].extend(folder["_links"])
-            for subname, subfolder in folder.items():
-                if subname != "_links" and isinstance(subfolder, dict) and "_links" in subfolder:
-                    merged_folder["_links"].extend(subfolder["_links"])
-        
-        # Remove the small folders and add the merged one
-        if merged_folder["_links"]: # Only add if there are actually links
-          for name in folders_to_merge:
-              if name in node: del node[name]
-          node[merged_name] = merged_folder
-        else: # If no links, just remove the empty structures
-           print(f"Skipping consolidation for {merged_name} as it resulted in no links.")
-           for name in folders_to_merge:
-              if name in node: del node[name] 
-
-    # Final check: Remove completely empty folders that might result from consolidation
-    for name, child in list(node.items()):
-        if name != "_links" and isinstance(child, dict) and not child:
-            print(f"Removing empty folder: {parent_path}/{name}")
-            del node[name]
+            # Remove original small folders
+            if name in consolidated_node: del consolidated_node[name] 
             
-    return node
+        # Add the merged folder if it has links
+        if merged_folder["_links"]:
+            consolidated_node[merged_name] = merged_folder
+        else:
+            print(f"Skipping consolidation for {merged_name}, resulted in no links.")
+
+    return consolidated_node
 
 def display_tree(node, prefix="", is_last=True, max_links=3):
     """Print tree structure of bookmarks organization."""
@@ -959,6 +1205,7 @@ if __name__ == "__main__":
     ap.add_argument("outfile", help="new HTML to import")
     ap.add_argument("--auto", action="store_true", help="Skip interactive confirmation")
     ap.add_argument("--skip-consolidation", action="store_true", help="Skip folder consolidation step")
+    ap.add_argument("--fetch-content", action="store_true", help="Attempt to fetch web page content (title, description) for better classification (SLOWER)")
     ap.add_argument("--model", default="gpt-4o", choices=["gpt-4o", "gpt-4o-mini"], 
                     help="OpenAI model to use (default: gpt-4o") # o4-mini a chain of thought model, so you cannot use temperature or max_tokens
     ap.add_argument("--debug", action="store_true", help="Print detailed debugging information")
@@ -1022,7 +1269,7 @@ if __name__ == "__main__":
         print("Exiting without creating output file.")
         sys.exit(1)
         
-    tree, analysis = build_tree(bookmarks)
+    tree, analysis = build_tree(bookmarks, args=args)
     
     # Display tree structure for user review
     print("\n=== Bookmark Collection Analysis ===")
@@ -1049,4 +1296,17 @@ if __name__ == "__main__":
     
     export_netscape(tree, args.outfile)
     verify_bookmarks(args.infile, args.outfile)
+    
+    # Save the classification mapping
+    try:
+        import json
+        mapping_file = args.outfile.replace(".html", "_mapping.json")
+        # Convert tuple keys to strings for JSON compatibility
+        string_key_classifications = {f"{title}::{url}": path for (title, url), path in classifications.items()}
+        with open(mapping_file, 'w', encoding='utf-8') as f:
+            json.dump(string_key_classifications, f, indent=2, ensure_ascii=False)
+        print(f"Classification mapping saved to {mapping_file}")
+    except Exception as e:
+        print(f"Error saving classification mapping: {e}")
+        
     print(f"Complete! Organized bookmarks written to {args.outfile}")
